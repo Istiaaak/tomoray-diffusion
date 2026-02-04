@@ -1,0 +1,3 @@
+defaults:
+  - dataset: VerSe
+  - model: ddpm

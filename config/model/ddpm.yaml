@@ -1,0 +1,38 @@
+name: diffusion
+diffusion: GaussianDiffusion
+denoising_fn: Unet3D
+
+
+vqgan_ckpt: '/data/Istiak/code/vqgan/checkpoints/verse/lightning_logs/version_6/checkpoints/best_checkpoint-epoch=109-val/recon_loss=0.09.ckpt'
+
+diffusion_img_size: 64
+diffusion_depth_size: 64
+diffusion_num_channels: 8
+
+
+dim_mults: [1, 2, 4, 8]
+
+
+batch_size: 1
+train_lr: 1e-4            
+train_num_steps: 700000
+gradient_accumulate_every: 2
+ema_decay: 0.995
+amp: False
+
+
+timesteps: 1000
+sampling_timesteps: 250
+loss_type: l1
+objective: pred_noise
+cond_scale: 2.0
+
+
+results_folder: './results'
+results_folder_postfix: 'diffusion_experiment'
+load_milestone: -1 
+save_and_sample_every: 1000
+
+num_workers: 8
+gpus: 0
+logger: tensorboard

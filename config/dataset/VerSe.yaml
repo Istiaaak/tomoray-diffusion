@@ -1,0 +1,3 @@
+name: 'VerSe'
+folder: './data'
+split_path: './data/splits.json'

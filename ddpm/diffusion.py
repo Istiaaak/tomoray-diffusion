@@ -940,7 +940,8 @@ class Trainer(object):
         num_sample_rows=1,
         max_grad_norm=None,
         num_workers=20,
-        use_tensorboard=True
+        use_tensorboard=True,
+        debug_overfit=False
     ):
         super().__init__()
         self.model = diffusion_model
@@ -965,6 +966,7 @@ class Trainer(object):
 
         self.cfg = cfg
 
+        self.debug_overfit = debug_overfit
 
         self.writer = None
         if use_tensorboard:
@@ -986,7 +988,7 @@ class Trainer(object):
             num_workers=num_workers,
 
         )
-
+    
         val_dl = DataLoader(
             val_dataset,
             batch_size=1,
@@ -995,8 +997,21 @@ class Trainer(object):
             num_workers=num_workers,
         )
 
+        if self.debug_overfit:
+            print("Debug mode:")
+
+            self.static_batch = next(iter(dl))
+
+            def infinite_static_loader():
+                while True:
+                    yield self.static_batch
+            
+            self.dl = infinite_static_loader()
+        else:
+            self.dl = cycle(dl)
+
+
         self.len_dataloader = len(dl)
-        self.dl = cycle(dl)
 
         self.opt = Adam(
             list(diffusion_model.parameters()) + list(fusion_model.parameters()), 
@@ -1132,7 +1147,7 @@ class Trainer(object):
         log_fn=noop
     ):
         assert callable(log_fn)
-
+        assert self.train_num_steps >= self.step_start_ema, 'num_steps must be greater that start_ema'
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 batch = next(self.dl)
@@ -1144,12 +1159,16 @@ class Trainer(object):
                 with autocast(enabled=self.amp):
                     
                     cond = self.fusion_model(xrays, angles)
-
+                    if self.debug_overfit:
+                        current_cond_drop = 0.0
+                    else:
+                        current_cond_drop = 0.1
+                        
                     loss = self.model(
                         img,
                         cond=cond,
                         # classifier free guidance
-                        cond_drop_prob=0.1
+                        cond_drop_prob=current_cond_drop
                     )
 
                 self.scaler.scale(loss / self.gradient_accumulate_every).backward()

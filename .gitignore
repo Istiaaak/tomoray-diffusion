@@ -1,1 +1,5 @@
 *.pickle
+results/
+outputs/
+__pycache__/
+test.ipynb

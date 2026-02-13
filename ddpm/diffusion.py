@@ -26,7 +26,8 @@ from rotary_embedding_torch import RotaryEmbedding
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from ...vqgan.vq_gan_3d.model.vqgan import VQGAN
+from vq_gan_3d.model.vqgan import VQGAN
+from evaluation.metrics import Metrics
 # helpers functions
 
 
@@ -396,7 +397,7 @@ class Unet3D(nn.Module):
         cond_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        channels=3,  # 8
+        channels=3,  
         cond_channels=128,
         attn_heads=8,
         attn_dim_head=32,
@@ -453,18 +454,6 @@ class Unet3D(nn.Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
-
-        '''
-        # text conditioning
-
-        self.has_cond = exists(cond_dim) or use_bert_text_cond
-        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
-
-        self.null_cond_emb = nn.Parameter(
-            torch.randn(1, cond_dim)) if self.has_cond else None
-
-        cond_dim = time_dim + int(cond_dim or 0)
-        '''
 
         # layers 
 
@@ -533,7 +522,7 @@ class Unet3D(nn.Module):
         if cond_scale == 1:
             return logits
 
-        null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
+        null_logits = self.forward(*args, cond_drop_prob=1., **kwargs)
         
         return null_logits + (logits - null_logits) * cond_scale
 
@@ -941,7 +930,7 @@ class Trainer(object):
         max_grad_norm=None,
         num_workers=20,
         use_tensorboard=True,
-        debug_overfit=False
+        debug_overfit=True
     ):
         super().__init__()
         self.model = diffusion_model
@@ -965,7 +954,6 @@ class Trainer(object):
         num_frames = diffusion_model.num_frames
 
         self.cfg = cfg
-
         self.debug_overfit = debug_overfit
 
         self.writer = None
@@ -996,7 +984,7 @@ class Trainer(object):
             pin_memory=True,
             num_workers=num_workers,
         )
-
+        self.metrics = Metrics(results_folder, val_dl)
         if self.debug_overfit:
             print("Debug mode:")
 
@@ -1101,45 +1089,6 @@ class Trainer(object):
         plt.savefig(path)
         plt.close()
 
-
-    @torch.no_grad()
-    def validate(self):
-        
-        self.model.eval()
-        self.fusion_model.eval()
-
-        total_loss = 0.0
-        num_batches = 0
-
-        for i, batch in enumerate(self.val_dl):
-
-            img = batch['image'].cuda()
-            xrays = batch['projections'].cuda()
-            angles = batch['angles'].cuda()
-
-            with autocast(enabled=self.amp):
-                
-                cond = self.fusion_model(xrays, angles)
-
-                loss = self.model(
-                    img,
-                    cond=cond,
-                    cond_drop_prob=0.0
-                )
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        avg_val_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        print(f"Validation step {self.step}: Loss = {avg_val_loss:.6f}")
-
-        if self.writer:
-            self.writer.add_scalar("loss/val", avg_val_loss, self.step)
-
-        self.model.train()
-        self.fusion_model.train()
-
-        
     def train(
         self,
         prob_focus_present=0.,
@@ -1159,11 +1108,39 @@ class Trainer(object):
                 with autocast(enabled=self.amp):
                     
                     cond = self.fusion_model(xrays, angles)
+
+                    if self.step % self.save_and_sample_every == 0:
+
+                        debug_dir = self.results_folder / 'debug_fusion_maps'
+                        debug_dir.mkdir(exist_ok=True)
+
+                        with torch.no_grad():
+                            fusion_features = cond.detach().cpu()
+                            
+                            d_mid = fusion_features.shape[2] // 2
+                            h_mid = fusion_features.shape[3] // 2
+                            w_mid = fusion_features.shape[4] // 2
+
+                            slice_axial = fusion_features[:, :, d_mid, :, :].mean(dim=1, keepdim=True)
+                            slice_coronal = fusion_features[:, :, :, h_mid, :].mean(dim=1, keepdim=True)
+                            slice_sagittal = fusion_features[:, :, :, :, w_mid].mean(dim=1, keepdim=True)
+
+                            def save_norm(tensor, name):
+                                        vmin, vmax = tensor.min(), tensor.max()
+                                        tensor = (tensor - vmin) / (vmax - vmin + 1e-8)
+                                        self.save_image(tensor, str(debug_dir / f'{name}_{self.step}.png'))
+
+                            save_norm(slice_axial, 'fusion_axial')
+                            save_norm(slice_coronal, 'fusion_coronal')
+                            save_norm(slice_sagittal, 'fusion_sagittal')
+
+
+
                     if self.debug_overfit:
                         current_cond_drop = 0.0
                     else:
                         current_cond_drop = 0.1
-                        
+
                     loss = self.model(
                         img,
                         cond=cond,
@@ -1196,6 +1173,7 @@ class Trainer(object):
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 self.ema_model.eval()
+                self.fusion_model.eval()
 
                 with torch.no_grad():
                     milestone = self.step // self.save_and_sample_every
@@ -1203,6 +1181,7 @@ class Trainer(object):
 
                     sample_xrays = xrays[:1]
                     sample_angles = angles[:1]
+                    real_img = img[:1]
                     
                     sample_cond = self.fusion_model(sample_xrays, sample_angles)
 
@@ -1214,7 +1193,7 @@ class Trainer(object):
 
                     mid = all_samples.shape[2] // 2
                     gen_slice = all_samples[0, 0, mid, :, :].cpu()
-                    real_slice = img[0, 0, mid, :, :].cpu()
+                    real_slice = real_img[0, 0, mid, :, :].cpu()
 
                     gen_slice = (gen_slice + 1) * 0.5
                     real_slice = (real_slice + 1) * 0.5 
@@ -1225,6 +1204,15 @@ class Trainer(object):
                         str(self.results_folder / f'sample-{milestone}.png')
                     )
 
+                    gen_vol_np = all_samples[0, 0].cpu().numpy()
+                    real_vol_np = real_img[0, 0].cpu().numpy()
+
+                    self.metrics.save_gif(real_vol=real_vol_np, fake_vol=gen_vol_np, milestone=milestone)
+                    '''
+                    if milestone % 5 == 0:
+                        self.metrics.update_metrics(self.ema_model, self.fusion_model, self.step)
+                    '''
+                    
                     if self.writer:
                         self.writer.add_image("GT", real_slice.unsqueeze(0), self.step)
                         self.writer.add_image("Generated", gen_slice.unsqueeze(0), self.step)
@@ -1237,8 +1225,13 @@ class Trainer(object):
         print('Training completed')
 
 
-
-
+def video_tensor_to_gif(tensor, path, duration=120, loop=0, optimize=True):
+    tensor = ((tensor - tensor.min()) / (tensor.max() - tensor.min())) * 1.0
+    images = map(T.ToPILImage(), tensor.unbind(dim=1))
+    first_img, *rest_imgs = images
+    first_img.save(path, save_all=True, append_images=rest_imgs,
+                   duration=duration, loop=loop, optimize=optimize)
+    return images
 
 
 def utils_save_grid_images(images, path):
@@ -1259,3 +1252,4 @@ def utils_save_grid_images(images, path):
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
+

@@ -1,0 +1,3 @@
+name: 'ctspine1k'
+folder: '/data/datasets/CTSpine1K/raw_data/CTs-drr'
+split_path: '/data/datasets/CTSpine1K/raw_data/CTs-drr/splits.json'

@@ -1,4 +1,4 @@
-name: diffusion
+name: diffusion_10
 diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
@@ -8,6 +8,9 @@ vqgan_ckpt: '/data/Istiak/code/vqgan/checkpoints/verse/lightning_logs/version_6/
 diffusion_img_size: 64
 diffusion_depth_size: 64
 diffusion_num_channels: 8
+
+vol_size_mm: [400, 400, 400]
+det_size_mm: 400
 
 
 dim_mults: [1, 2, 4, 8]
@@ -23,13 +26,13 @@ amp: False
 
 timesteps: 1000
 sampling_timesteps: 250
-loss_type: l1
+loss_type: l2
 objective: pred_noise
 cond_scale: 2.0
 
 
 results_folder: './results'
-results_folder_postfix: 'diffusion_experiment'
+results_folder_postfix: 'diffusion_experiment1'
 load_milestone: -1 
 save_and_sample_every: 1000
 

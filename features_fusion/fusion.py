@@ -103,24 +103,3 @@ class Fusion(nn.Module):
     def forward_bypass(self, x_rays, angles):
 
         return self.project_and_fuse(x_rays, angles)
-
-
-
-def get_gt_aligned_xyz(data: dict) -> np.ndarray:
-    img_xyz = data["image"].astype(np.float32)
-    preprocess = data.get("preprocess", None)
-    if preprocess is not None and preprocess.get("image_matches_projections", False):
-        return img_xyz
-    if preprocess is None: return img_xyz
-    ori = preprocess.get("internal_orientation") or preprocess.get("orientation_used")
-    if ori == "LPI": img_xyz = img_xyz[::-1, ::-1, ::-1].copy()
-    flip_used = preprocess.get("flip_used", "none")
-    if flip_used == "x": img_xyz = img_xyz[::-1, :, :].copy()
-    elif flip_used == "y": img_xyz = img_xyz[:, ::-1, :].copy()
-    elif flip_used == "z": img_xyz = img_xyz[:, :, ::-1].copy()
-    return img_xyz
-
-def show_yz(vol_xyz, x, ax, title):
-    ax.imshow(vol_xyz[x, :, :].T, cmap="gray", origin="lower")
-    ax.set_title(title)
-    ax.axis("off")

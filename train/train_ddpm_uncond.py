@@ -3,13 +3,12 @@ import os
 import torch
 import hydra
 from omegaconf import DictConfig, open_dict
-from torch.utils.data import Subset
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from ddpm.diffusion import Unet3D, GaussianDiffusion, Trainer
-from features_fusion.fusion import Fusion
+from ddpm.diffusion import Unet3D, GaussianDiffusion, UnconditionalTrainer  
 from get_dataset import get_dataset
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
@@ -34,24 +33,19 @@ def run(cfg: DictConfig):
 
     latent_size = cfg.model.diffusion_img_size
     latent_channels = cfg.model.diffusion_num_channels
-    fusion_channels = 128
+    fusion_channels = 0
 
-    fusion_model = Fusion(
-        volume_shape=(latent_size, latent_size, latent_size),
-        vol_size_mm=cfg.model.vol_size_mm,
-        det_size_mm=cfg.model.det_size_mm,
-        n_features=fusion_channels
-    ).cuda()
 
     print("Initialization of 3D U-Net")
     unet = Unet3D(
         dim=64,
         dim_mults=cfg.model.dim_mults,
         channels=latent_channels,
-        cond_channels=fusion_channels
+        cond_channels=0
     ).cuda()
 
     print("Initialization of diffusion")
+
     diffusion = GaussianDiffusion(
         unet,
         vqgan_ckpt=cfg.model.vqgan_ckpt,
@@ -59,7 +53,7 @@ def run(cfg: DictConfig):
         num_frames=latent_size,
         channels=latent_channels,
         timesteps=cfg.model.timesteps,
-        loss_type='l1'
+        loss_type='l2'
 
     ).cuda()
 
@@ -67,13 +61,11 @@ def run(cfg: DictConfig):
 
     train_dataset, val_dataset, _ = get_dataset(cfg)
 
-    trainer = Trainer(
+    trainer = UnconditionalTrainer(
         diffusion_model=diffusion,
-        fusion_model=fusion_model,
         cfg=cfg,
         dataset=train_dataset,
         val_dataset=val_dataset,
-
         train_batch_size=cfg.model.batch_size,
         train_lr=cfg.model.train_lr,
         train_num_steps=cfg.model.train_num_steps,
@@ -83,7 +75,6 @@ def run(cfg: DictConfig):
         save_and_sample_every=cfg.model.save_and_sample_every,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
-        debug_overfit=False
 
     )
 

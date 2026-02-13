@@ -4,7 +4,7 @@ import os
 
 from dataset.verse import VerseDataset
 
-def get_dataset(cfg):
+def get_dataset(cfg, overfit_n=None):
 
     data_folder = cfg.dataset.folder 
     
@@ -16,30 +16,30 @@ def get_dataset(cfg):
     with open(split_path, 'r') as f:
         splits = json.load(f)
 
+    train_filenames = splits["train"]
+
+    if overfit_n is not None and overfit_n > 0:
+        print(f"Overfit mode with {overfit_n} CTs")
+        train_filenames = train_filenames[:overfit_n]
+
+
+
     # Train
     train_dataset = VerseDataset(
         folder=data_folder,
-        filenames=splits['train'],
-        num_train_angles=None
+        filenames=train_filenames,
     )
 
     # Val
     val_dataset = VerseDataset(
         folder=data_folder,
         filenames=splits['val'],
-        num_train_angles=None
     )
 
     # Test
     test_dataset = VerseDataset(
         folder=data_folder,
         filenames=splits.get('test', []),
-        num_train_angles=None
     )
 
-    print(f"--- Datasets Setup ---")
-    print(f"Split File : {split_path}")
-    print(f"Train size : {len(train_dataset)}")
-    print(f"Val size   : {len(val_dataset)}")
-    
     return train_dataset, val_dataset, test_dataset

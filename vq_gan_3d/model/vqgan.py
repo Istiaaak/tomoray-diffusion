@@ -50,6 +50,9 @@ class VQGAN(pl.LightningModule):
     def __init__(self, cfg, val_dataloader=None):
         super().__init__()
 
+        if isinstance(cfg, dict):
+            cfg = OmegaConf.create(cfg)
+
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
         self.cfg = cfg

@@ -78,22 +78,25 @@ class Metrics:
 
                 cond = fusion_model(xrays, angles)
                 
-                gen = model.sample(cond=cond, batch_size=ct.shape[0])
+                #gen = model.sample(cond=cond, batch_size=ct.shape[0])
+                gen = model.sample_dpm(cond=cond, batch_size=ct.shape[0], steps=20)
 
                 input1 = (gen + 1) / 2
                 input2 = (ct + 1) / 2
 
 
                 ssim_value, _ = self.ssim_3d(input1, input2)
-                ssim.append(ssim_value)
+                ssim.append(ssim_value.item() if isinstance(ssim_value, torch.Tensor) else ssim_value)
 
                 pips_value = self.pips_3d(input1, input2)
-                pips.append(pips_value)
+                pips.append(pips_value.item() if isinstance(pips_value, torch.Tensor) else pips_value)
 
                 psnr_value = self.psnr_3d(input1, input2)
-                psnr.append(psnr_value)
+                psnr.append(psnr_value.item() if isinstance(psnr_value, torch.Tensor) else psnr_value)
 
-                #TODO RMSE?
+                mse = torch.mean((input1 - input2) ** 2)
+                rmse_value = torch.sqrt(mse)
+                rmse.append(rmse_value.item())
 
         model.train()
         fusion_model.train()
@@ -101,8 +104,9 @@ class Metrics:
         avg_pips = sum(pips) / len(pips) if pips else 0
         avg_ssim = sum(ssim) / len(ssim) if ssim else 0
         avg_psnr = sum(psnr) / len(psnr) if psnr else 0
+        avg_rmse = sum(rmse) / len(rmse) if rmse else 0
 
-        return avg_pips, avg_ssim, avg_psnr
+        return avg_pips, avg_ssim, avg_psnr, avg_rmse
     
 
 
@@ -119,7 +123,8 @@ class Metrics:
                 ct, xrays, angles = self.process_input(batch)
                 cond = fusion_model(xrays, angles)
 
-                gen = model.sample(cond=cond, batch_size= ct.shape[0])
+                #gen = model.sample(cond=cond, batch_size= ct.shape[0])
+                gen = model.sample_dpm(cond=cond, batch_size=ct.shape[0], steps=20)
 
                 input1 = (gen + 1) / 2
                 input2 = (ct + 1) / 2
@@ -160,19 +165,24 @@ class Metrics:
 
 
                 ssim_value, _ = self.ssim_3d(input1, input2)
-                ssim.append(ssim_value.item())
+                ssim.append(ssim_value.item() if isinstance(ssim_value, torch.Tensor) else ssim_value)
 
                 pips_value = self.pips_3d(input1, input2)
-                pips.append(pips_value)
+                pips.append(pips_value.item() if isinstance(pips_value, torch.Tensor) else pips_value)
 
                 psnr_value = self.psnr_3d(input1, input2)
-                psnr.append(psnr_value)
+                psnr.append(psnr_value.item() if isinstance(psnr_value, torch.Tensor) else psnr_value)
+
+                mse = torch.mean((input1 - input2) ** 2)
+                rmse_value = torch.sqrt(mse)
+                rmse.append(rmse_value.item())
 
         avg_pips = sum(pips) / len(pips) if pips else 0
         avg_ssim = sum(ssim) / len(ssim) if ssim else 0
         avg_psnr = sum(psnr) / len(psnr) if psnr else 0
+        avg_rmse = sum(rmse) / len(rmse) if rmse else 0
 
-        return avg_pips, avg_ssim, avg_psnr
+        return avg_pips, avg_ssim, avg_psnr, avg_rmse
     
 
 
@@ -210,12 +220,12 @@ class Metrics:
         plt.savefig(os.path.join(path_slices, f'{idx}_comparison.png'), bbox_inches='tight', pad_inches=0)
         plt.close()
 
-    def save_gif(self, real_vol, fake_vol, milestone, idx=0):
+    def save_gif(self, real_vol, fake_vol, milestone, idx=0, phase="val"):
         """
         real_vol, fake_vol : (D, H, W) ou (1, D, H, W)
         xray : (H, W) ou (1, H, W)
         """
-        path_video = os.path.join(self.root_dir, 'video_results')
+        path_video = os.path.join(self.root_dir, 'video_results', phase)
         os.makedirs(path_video, exist_ok=True)
         
         if real_vol.ndim == 4: real_vol = real_vol[0]

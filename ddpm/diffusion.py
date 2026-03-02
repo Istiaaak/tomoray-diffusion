@@ -28,8 +28,10 @@ import matplotlib.pyplot as plt
 
 from vq_gan_3d.model.vqgan import VQGAN
 from evaluation.metrics import Metrics
-# helpers functions
+from evaluation.dpm_solver_pytorch import NoiseScheduleVP, model_wrapper, DPM_Solver
 
+
+# helpers functions
 
 def exists(x):
     return x is not None
@@ -79,6 +81,35 @@ def is_list_str(x):
     return all([type(el) == str for el in x])
 
 
+def volume_to_gif(tensor, path, duration=100, loop=0):
+    """
+    :param tensor: [C, D, H, W]
+    """
+    tensor = (tensor.clone().detach() + 1) + 0.5
+    tensor = tensor.clamp(0, 1)
+
+    images_tensors = tensor.unbind(dim=1) 
+    
+    to_pil = T.ToPILImage()
+    images_pil = [to_pil(img) for img in images_tensors]
+
+    if len(images_pil) > 0:
+        images_pil[0].save(
+            path, 
+            save_all=True, 
+            append_images=images_pil[1:],
+            duration=duration, 
+            loop=loop,
+            optimize=False
+        )
+
+
+def normalize_img(t):
+    return t * 2 - 1
+
+
+def unnormalize_img(t):
+    return (t + 1) * 0.5
 
 # relative positional bias
 
@@ -597,8 +628,6 @@ class Unet3D(nn.Module):
         x = torch.cat((x, r), dim=1)
         return self.final_conv(x)
 
-
-
 # model
 
 
@@ -810,6 +839,49 @@ class GaussianDiffusion(nn.Module):
         return _sample
 
     @torch.inference_mode()
+    def sample_dpm(self, cond=None, cond_scale=1., batch_size=1, steps=20):
+
+        device = self.betas.device
+
+        noise_schedule = NoiseScheduleVP(schedule='discrete', betas=self.betas)
+
+        def unet_conditioned_wrapper(x, t, **kwargs):
+            return self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
+        
+        model_fn = model_wrapper(
+            unet_conditioned_wrapper,
+            noise_schedule,
+            model_type="noise"
+        )
+
+        dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type='dpmsolver++')
+
+
+        batch_size = cond.shape[0] if exists(cond) else batch_size
+        image_size = self.image_size
+        channels = self.channels
+        num_frames = self.num_frames
+
+        x_T = torch.randn((batch_size, channels, num_frames, image_size, image_size), device=device)
+
+        x_sample = dpm_solver.sample(
+            x_T,
+            steps=steps,
+            order=2,
+            skip_type="time_uniform",
+            method="multistep",
+        )
+
+        if isinstance(self.vqgan, VQGAN):
+            x_sample = (((x_sample + 1.0) / 2.0) * (self.vqgan.codebook.embeddings.max() -
+                                                    self.vqgan.codebook.embeddings.min())) + self.vqgan.codebook.embeddings.min()
+            x_sample = self.vqgan.decode(x_sample, quantize=True)
+        else:
+            x_sample = unnormalize_img(x_sample)
+
+        return x_sample
+    
+    @torch.inference_mode()
     def interpolate(self, x1, x2, t=None, lam=0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
@@ -867,51 +939,13 @@ class GaussianDiffusion(nn.Module):
 
         return self.p_losses(x, t, *args, **kwargs)
 
-
-
-def volume_to_gif(tensor, path, duration=100, loop=0):
-    """
-    :param tensor: [C, D, H, W]
-    """
-    tensor = (tensor.clone().detach() + 1) + 0.5
-    tensor = tensor.clamp(0, 1)
-
-    images_tensors = tensor.unbind(dim=1) 
-    
-    to_pil = T.ToPILImage()
-    images_pil = [to_pil(img) for img in images_tensors]
-
-    if len(images_pil) > 0:
-        images_pil[0].save(
-            path, 
-            save_all=True, 
-            append_images=images_pil[1:],
-            duration=duration, 
-            loop=loop,
-            optimize=False
-        )
-
-
-
-
-def normalize_img(t):
-    return t * 2 - 1
-
-
-def unnormalize_img(t):
-    return (t + 1) * 0.5
-
-
-
-
-
 class Trainer(object):
     def __init__(
         self,
         diffusion_model,
         fusion_model,
         cfg,
-        folder=None,
+        accelerator=None,
         dataset=None,
         val_dataset=None,
         *,
@@ -933,11 +967,16 @@ class Trainer(object):
         debug_overfit=True
     ):
         super().__init__()
+
+        self.accelerator = accelerator
+        self.is_main = self.accelerator.is_main_process if self.accelerator else True
+        self.device = self.accelerator.device if self.accelerator else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.model = diffusion_model
         self.fusion_model = fusion_model
 
         self.ema = EMA(ema_decay)
-        self.ema_model = copy.deepcopy(self.model)
+        self.ema_model = copy.deepcopy(self.model).to(self.device)
 
         self.update_ema_every = update_ema_every
 
@@ -957,7 +996,7 @@ class Trainer(object):
         self.debug_overfit = debug_overfit
 
         self.writer = None
-        if use_tensorboard:
+        if use_tensorboard and self.is_main:
             log_dir = os.path.join(results_folder, 'logs')
             self.writer = SummaryWriter(log_dir=log_dir)
             print(f"Logs saved in {log_dir}")
@@ -965,7 +1004,8 @@ class Trainer(object):
         assert dataset is not None, "Provide a dataset"
         self.ds = dataset
 
-        print(f'found {len(self.ds)} CTs.')
+        if self.is_main:
+            print(f'found {len(self.ds)} CTs.')
         assert len(self.ds) > 0, 'need to have at least 1 CT to start training'
 
         dl = DataLoader(
@@ -984,7 +1024,23 @@ class Trainer(object):
             pin_memory=True,
             num_workers=num_workers,
         )
+
+        self.opt = Adam(
+            list(diffusion_model.parameters()) + list(fusion_model.parameters()), 
+            lr=train_lr
+            )
+
+        if self.accelerator:
+            self.model, self.fusion_model, self.opt, dl, val_dl = self.accelerator.prepare(
+                self.model, self.fusion_model, self.opt, dl, val_dl
+            )
+        else:
+            self.model = self.model.to(self.device)
+            self.fusion_model = self.fusion_model.to(self.device)
+
+        self.val_dl = val_dl
         self.metrics = Metrics(results_folder, val_dl)
+
         if self.debug_overfit:
             print("Debug mode:")
 
@@ -1000,11 +1056,6 @@ class Trainer(object):
 
 
         self.len_dataloader = len(dl)
-
-        self.opt = Adam(
-            list(diffusion_model.parameters()) + list(fusion_model.parameters()), 
-            lr=train_lr
-            )
         
         self.step = 0
 
@@ -1019,19 +1070,28 @@ class Trainer(object):
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.ema_model.load_state_dict(self.model.state_dict())
+        unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
+        self.ema_model.load_state_dict(unwrapped_model.state_dict())
 
     def step_ema(self):
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
-        self.ema.update_model_average(self.ema_model, self.model)
+        unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
+        self.ema.update_model_average(self.ema_model, unwrapped_model)
 
     def save(self, milestone):
+
+        if not self.is_main:
+            return
+        
+        unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
+        unwrapped_fusion = self.accelerator.unwrap_model(self.fusion_model) if self.accelerator else self.fusion_model
+
         data = {
             'step': self.step,
-            'model': self.model.state_dict(),
-            'fusion': self.fusion_model.state_dict(),
+            'model': unwrapped_model.state_dict(),
+            'fusion': unwrapped_fusion.state_dict(),
             'ema': self.ema_model.state_dict(),
             'scaler': self.scaler.state_dict()
         }
@@ -1101,15 +1161,15 @@ class Trainer(object):
             for i in range(self.gradient_accumulate_every):
                 batch = next(self.dl)
 
-                img = batch['image'].cuda()
-                xrays = batch['projections'].cuda()
-                angles = batch['angles'].cuda()
+                img = batch['image'].to(self.device)
+                xrays = batch['projections'].to(self.device)
+                angles = batch['angles'].to(self.device)
 
                 with autocast(enabled=self.amp):
                     
                     cond = self.fusion_model(xrays, angles)
 
-                    if self.step % self.save_and_sample_every == 0:
+                    if self.step % self.save_and_sample_every == 0 and self.is_main:
 
                         debug_dir = self.results_folder / 'debug_fusion_maps'
                         debug_dir.mkdir(exist_ok=True)
@@ -1148,47 +1208,87 @@ class Trainer(object):
                         cond_drop_prob=current_cond_drop
                     )
 
-                self.scaler.scale(loss / self.gradient_accumulate_every).backward()
+                if self.accelerator:
+                    self.accelerator.backward(loss / self.gradient_accumulate_every)
+                else:
+                    self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
-            if self.step % 10 == 0:
+            if self.step % 10 == 0 and self.is_main:
                 print(f'{self.step}: {loss.item()}')
 
                 if self.writer:
                     self.writer.add_scalar('loss/train', loss.item(), self.step)
-            
-            log_fn({'loss': loss.item()})
 
+            if self.is_main:
+                log_fn({'loss': loss.item()})
 
-            if exists(self.max_grad_norm):
-                self.scaler.unscale_(self.opt)
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.max_grad_norm)
+            if self.accelerator:
+                if exists(self.max_grad_norm):
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.opt.step()
+                self.opt.zero_grad()
+            else:
+                if exists(self.max_grad_norm):
+                    self.scaler.unscale_(self.opt)
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm)
 
-            self.scaler.step(self.opt)
-            self.scaler.update()
-            self.opt.zero_grad()
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                self.opt.zero_grad()
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+            if self.step != 0 and self.step % self.save_and_sample_every == 0 and self.is_main:
                 self.ema_model.eval()
                 self.fusion_model.eval()
 
                 with torch.no_grad():
+
+                    print("Calculating Validation Loss..")
+                    total_val_loss = 0.0
+                    for val_batch in self.val_dl:
+                        val_img = val_batch["image"].to(self.device)
+                        val_xrays = val_batch["projections"].to(self.device)
+                        val_angles = val_batch["angles"].to(self.device)
+
+                        with autocast(enabled=self.amp):
+                            val_cond = self.fusion_model(val_xrays, val_angles)
+                            val_loss = self.ema_model(
+                                val_img,
+                                cond=val_cond,
+                                cond_drop_prob=0.0
+                            )
+                        
+                        total_val_loss+= val_loss.item()
+
+                        avg_val_loss = total_val_loss / len(self.val_dl)
+                        print(f"Validation Loss at step {self.step}: {avg_val_loss:.4f}")
+
+                        if self.writer:
+                            self.writer.add_scalar('loss/val', avg_val_loss, self.step)
+
                     milestone = self.step // self.save_and_sample_every
                     print(f"Sampling for milestone {milestone}...")
 
+                    train_sample_dir = self.results_folder / 'train_samples'
+                    val_sample_dir = self.results_folder / 'val_samples'
+                    train_sample_dir.mkdir(exist_ok=True)
+                    val_sample_dir.mkdir(exist_ok=True)
+
+                    # Inference on training set
                     sample_xrays = xrays[:1]
                     sample_angles = angles[:1]
                     real_img = img[:1]
                     
                     sample_cond = self.fusion_model(sample_xrays, sample_angles)
 
-                    all_samples = self.ema_model.sample(
+                    all_samples = self.ema_model.sample_dpm(
                         cond=sample_cond,
                         cond_scale=2.0,
-                        batch_size=1
+                        batch_size = 1,
+                        steps=20
                     )
 
                     mid = all_samples.shape[2] // 2
@@ -1201,17 +1301,51 @@ class Trainer(object):
                     self.save_comparison(
                         real_slice,
                         gen_slice,
-                        str(self.results_folder / f'sample-{milestone}.png')
+                        str(train_sample_dir / f'sample-{milestone}.png')
                     )
+
+                    if self.writer:
+                        self.writer.add_image("Train/GT", real_slice.unsqueeze(0), self.step)
+                        self.writer.add_image("Train/Generated", gen_slice.unsqueeze(0), self.step)
+
 
                     gen_vol_np = all_samples[0, 0].cpu().numpy()
                     real_vol_np = real_img[0, 0].cpu().numpy()
 
-                    self.metrics.save_gif(real_vol=real_vol_np, fake_vol=gen_vol_np, milestone=milestone)
-                    '''
+                    self.metrics.save_gif(real_vol=real_vol_np, fake_vol=gen_vol_np, milestone=milestone, phase='train')
+
+                    # Inference on validation set
+                    val_sample_batch = next(iter(self.val_dl))
+                    sample_xrays_val = val_sample_batch["projections"][:1].to(self.device)
+                    sample_angles_val = val_sample_batch["angles"][:1].to(self.device)
+                    real_img_val = val_sample_batch["image"][:1].to(self.device)
+
+                    sample_cond_val = self.fusion_model(sample_xrays_val, sample_angles_val)
+                    gen_val = self.ema_model.sample_dpm(
+                        cond=sample_cond_val, cond_scale=2.0, batch_size=1, steps=20
+                    )
+
+                    mid_v = gen_val.shape[2] // 2
+                    gen_slice_v = (gen_val[0, 0, mid_v, :, :].cpu() + 1) * 0.5
+                    real_slice_v = (real_img_val[0, 0, mid_v, :, :].cpu() + 1) * 0.5
+
+                    self.save_comparison(
+                        real_slice_v, gen_slice_v, 
+                        str(val_sample_dir / f'sample-{milestone}.png')
+                    )
+
+                    if self.writer:
+                        self.writer.add_image("Val/GT", real_slice_v.unsqueeze(0), self.step)
+                        self.writer.add_image("Val/Generated", gen_slice_v.unsqueeze(0), self.step)
+
+                    gen_val_np = gen_val[0, 0].cpu().numpy()
+                    real_val_np = real_img_val[0, 0].cpu().numpy()
+                    
+                    self.metrics.save_gif(real_vol=real_val_np, fake_vol=gen_val_np, milestone=milestone, phase="val")
+                    
                     if milestone % 5 == 0:
                         self.metrics.update_metrics(self.ema_model, self.fusion_model, self.step)
-                    '''
+                    
                     
                     if self.writer:
                         self.writer.add_image("GT", real_slice.unsqueeze(0), self.step)
@@ -1221,35 +1355,7 @@ class Trainer(object):
                 self.fusion_model.train()
             
             self.step += 1
-        
-        print('Training completed')
-
-
-def video_tensor_to_gif(tensor, path, duration=120, loop=0, optimize=True):
-    tensor = ((tensor - tensor.min()) / (tensor.max() - tensor.min())) * 1.0
-    images = map(T.ToPILImage(), tensor.unbind(dim=1))
-    first_img, *rest_imgs = images
-    first_img.save(path, save_all=True, append_images=rest_imgs,
-                   duration=duration, loop=loop, optimize=optimize)
-    return images
-
-
-def utils_save_grid_images(images, path):
-    n = len(images)
-    cols = int(math.sqrt(n))
-    rows = math.ceil(n / cols)
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*3))
-    axes = axes.flatten() if n > 1 else [axes]
-    
-    for i, ax in enumerate(axes):
-        if i < n:
-            ax.imshow(images[i], cmap='gray')
-            ax.axis('off')
-        else:
-            ax.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
+            
+        if self.is_main:
+            print('Training completed')
 

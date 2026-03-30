@@ -5,6 +5,8 @@ import torch
 import lpips
 import torch.nn.functional as F
 import nibabel as nib
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from einops import rearrange
 from torchvision import transforms as T
@@ -81,9 +83,11 @@ class Metrics:
                 #gen = model.sample(cond=cond, batch_size=ct.shape[0])
                 gen = model.sample_dpm(cond=cond, batch_size=ct.shape[0], steps=20)
 
-                input1 = (gen + 1) / 2
-                input2 = (ct + 1) / 2
+                #input1 = (gen + 1) / 2
+                #input2 = (ct + 1) / 2
 
+                input1 = torch.clamp((gen + 1) / 2, 0, 1)
+                input2 = torch.clamp((ct + 1) / 2, 0, 1)
 
                 ssim_value, _ = self.ssim_3d(input1, input2)
                 ssim.append(ssim_value.item() if isinstance(ssim_value, torch.Tensor) else ssim_value)
@@ -236,29 +240,49 @@ class Metrics:
             return (t * 255).astype(np.uint8)
 
         real_uint = to_uint8(real_vol) # (D, H, W)
-        fake_uint = to_uint8(fake_vol) # (D, H, W)
+        fake_uint = to_uint8(fake_vol) # (D, H, W)  
         
 
-        frames = []
-        for d in range(real_vol.shape[0]):
-            frame = np.concatenate((fake_uint[d], real_uint[d]), axis=1)
-            frames.append(Image.fromarray(frame))
-
-        save_path = os.path.join(path_video, f'step_{milestone}_sample_{idx}.gif')
-        frames[0].save(
-            save_path, 
-            save_all=True, 
-            append_images=frames[1:], 
-            duration=100,
-            loop=0
+        frames_axial = []
+        for d in range(real_uint.shape[0]):
+            frame = np.concatenate((fake_uint[d, :, :], real_uint[d, :, :]), axis=1)
+            frames_axial.append(Image.fromarray(frame))
+            
+        frames_axial[0].save(
+            os.path.join(path_video, f'step_{milestone}_sample_{idx}_1_axial.gif'), 
+            save_all=True, append_images=frames_axial[1:], duration=100, loop=0
         )
+        if phase == "test":
+
+            frames_coronal = []
+            for h in range(real_uint.shape[1]):
+                frame = np.concatenate((fake_uint[:, h, :], real_uint[:, h, :]), axis=1)
+                frames_coronal.append(Image.fromarray(frame))
+                
+            frames_coronal[0].save(
+                os.path.join(path_video, f'step_{milestone}_sample_{idx}_2_coronal.gif'), 
+                save_all=True, append_images=frames_coronal[1:], duration=100, loop=0
+            )
+
+            frames_sagittal = []
+            for w in range(real_uint.shape[2]):
+                frame = np.concatenate((fake_uint[:, :, w], real_uint[:, :, w]), axis=1)
+                frames_sagittal.append(Image.fromarray(frame))
+                
+            frames_sagittal[0].save(
+                os.path.join(path_video, f'step_{milestone}_sample_{idx}_3_sagittal.gif'), 
+                save_all=True, append_images=frames_sagittal[1:], duration=100, loop=0
+            )
 
     def pips_3d(self, img1, img2):
         # img: (B, C, D, H, W)
         assert img1.shape == img2.shape
         b, c, d, h, w = img1.shape
         total_loss = 0.0
-        
+
+        img1 = torch.clamp(img1, 0, 1)
+        img2 = torch.clamp(img2, 0, 1)
+
         for i in range(d):
             sl1 = img1[:, :, i, :, :]
             sl2 = img2[:, :, i, :, :]
@@ -271,12 +295,16 @@ class Metrics:
         return total_loss / d
 
     def psnr_3d(self, img1, img2):
+        img1 = torch.clamp(img1, 0, 1)
+        img2 = torch.clamp(img2, 0, 1)
         mse = torch.mean((img1 - img2) ** 2)
         psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
         return psnr
     
     def ssim_3d(self, img1, img2, window_size=11, size_average=True, val_range=None):
-        if val_range is None:
+        img1 = torch.clamp(img1, 0, 1)
+        img2 = torch.clamp(img2, 0, 1)
+        if val_range is None:   
             max_val = 255 if torch.max(img1) > 128 else 1
             min_val = -1 if torch.min(img1) < -0.5 else 0
             L = max_val - min_val

@@ -674,7 +674,7 @@ class GaussianDiffusion(nn.Module):
         self.denoise_fn = denoise_fn
 
         if vqgan_ckpt:
-            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt).cuda()
+            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt, weights_only=False).cuda()
             self.vqgan.eval()
         
         else:
@@ -948,6 +948,7 @@ class Trainer(object):
         accelerator=None,
         dataset=None,
         val_dataset=None,
+        test_dataset=None,
         *,
         ema_decay=0.995,
         num_frames=16,
@@ -1024,6 +1025,13 @@ class Trainer(object):
             pin_memory=True,
             num_workers=num_workers,
         )
+        test_dl = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=num_workers,
+        )
 
         self.opt = Adam(
             list(diffusion_model.parameters()) + list(fusion_model.parameters()), 
@@ -1039,6 +1047,7 @@ class Trainer(object):
             self.fusion_model = self.fusion_model.to(self.device)
 
         self.val_dl = val_dl
+        self.test_dl = test_dl
         self.metrics = Metrics(results_folder, val_dl)
 
         if self.debug_overfit:
@@ -1115,10 +1124,21 @@ class Trainer(object):
             data = torch.load(os.path.join(self.results_folder, 'checkpoints', f"sample-{milestone}.pt"))
 
         self.step = data['step']
-        self.model.load_state_dict(data['model'], **kwargs)
-        self.fusion_model.load_state_dict(data['fusion'])
-        self.ema_model.load_state_dict(data['ema'], **kwargs)
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_fusion = self.accelerator.unwrap_model(self.fusion_model)
+        unwrapped_ema = self.accelerator.unwrap_model(self.ema_model)
+
+        unwrapped_model.load_state_dict(data['model'], strict=False)
+        unwrapped_fusion.load_state_dict(data['fusion'], strict=False)
+        unwrapped_ema.load_state_dict(data['ema'], strict=False)
+        
+        #self.model.load_state_dict(data['model'], strict=False)
+        #self.fusion_model.load_state_dict(data['fusion'], strict=False)
+        #self.ema_model.load_state_dict(data['ema'], strict=False)
+
         self.scaler.load_state_dict(data['scaler'])
+
         print("checkpoint is successful loaded")
 
     def save_image(self, image_tensor, path, cols=3):
@@ -1359,3 +1379,103 @@ class Trainer(object):
         if self.is_main:
             print('Training completed')
 
+    @torch.inference_mode()
+    def test(self, milestone):
+
+        self.load(milestone)
+        self.ema_model.eval()
+        self.fusion_model.eval()
+
+        if self.is_main:
+            print(f"Loading test :")
+
+        total_test_loss = 0.0
+        total_psnr = 0.0
+        total_ssim = 0.0
+        
+        test_sample_dir = self.results_folder / 'test_samples'
+        if self.is_main:
+            test_sample_dir.mkdir(exist_ok=True)
+
+        for i, test_batch in enumerate(tqdm(self.test_dl, desc="Test")):
+            test_img = test_batch["image"].to(self.device)
+            test_xrays = test_batch["projections"].to(self.device)
+            test_angles = test_batch["angles"].to(self.device)
+
+            with autocast(enabled=self.amp):
+                test_cond = self.fusion_model(test_xrays, test_angles)
+                
+                test_loss = self.ema_model(
+                    test_img,
+                    cond=test_cond,
+                    cond_drop_prob=0.0 
+                )
+            total_test_loss += test_loss.item()
+
+            gen_test = self.ema_model.sample_dpm(
+                cond=test_cond, 
+                cond_scale=2.0, 
+                batch_size=test_img.shape[0], 
+                steps=20
+            )
+
+            input1 = (gen_test + 1) / 2.0
+            input2 = (test_img + 1) / 2.0
+
+            psnr_val = self.metrics.psnr_3d(input1, input2)
+            ssim_val, _ = self.metrics.ssim_3d(input1, input2)
+
+            total_psnr += psnr_val.item()
+            total_ssim += ssim_val.item()
+
+            if self.is_main:
+                tqdm.write(f"▶ CT {i+1} | PSNR: {psnr_val.item():.2f} dB | SSIM: {ssim_val.item():.4f}")
+
+            if self.is_main:
+                mid_z = input1.shape[2] // 2
+                mid_y = input1.shape[3] // 2
+                mid_x = input1.shape[4] // 2
+                
+
+                gen_slice_axial = input1[0, 0, mid_z, :, :].cpu()
+                real_slice_axial = input2[0, 0, mid_z, :, :].cpu()
+                self.save_comparison(
+                    real_slice_axial, gen_slice_axial, 
+                    str(test_sample_dir / f'test-sample-{i}-1_axial.png')
+                )
+
+                gen_slice_coronal = input1[0, 0, :, mid_y, :].cpu()
+                real_slice_coronal = input2[0, 0, :, mid_y, :].cpu()
+                self.save_comparison(
+                    real_slice_coronal, gen_slice_coronal, 
+                    str(test_sample_dir / f'test-sample-{i}-2_coronal.png')
+                )
+
+                gen_slice_sagittal = input1[0, 0, :, :, mid_x].cpu()
+                real_slice_sagittal = input2[0, 0, :, :, mid_x].cpu()
+                self.save_comparison(
+                    real_slice_sagittal, gen_slice_sagittal, 
+                    str(test_sample_dir / f'test-sample-{i}-3_sagittal.png')
+                )
+                
+                gen_test_np = gen_test[0, 0].cpu().numpy()
+                real_test_np = test_img[0, 0].cpu().numpy()
+                
+                self.metrics.save_gif(
+                    real_vol=real_test_np, 
+                    fake_vol=gen_test_np, 
+                    milestone=f"test_{i}", 
+                    phase="test"
+                )
+
+        num_batches = len(self.test_dl)
+        avg_test_loss = total_test_loss / num_batches
+        avg_psnr = total_psnr / num_batches
+        avg_ssim = total_ssim / num_batches
+
+        if self.is_main:
+            print(f"Test loss  : {avg_test_loss:.4f}")
+            print(f"Mean PSNR : {avg_psnr:.2f} dB")
+            print(f"Mean SSIM : {avg_ssim:.4f}")
+            
+        return avg_test_loss, avg_psnr, avg_ssim

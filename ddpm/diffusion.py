@@ -33,6 +33,9 @@ from evaluation.dpm_solver_pytorch import NoiseScheduleVP, model_wrapper, DPM_So
 
 # helpers functions
 
+def normalize_for_metrics(x):
+    return (x - x.min()) / (x.max() - x.min() + 1e-8)
+
 def exists(x):
     return x is not None
 
@@ -1283,11 +1286,11 @@ class Trainer(object):
                         
                         total_val_loss+= val_loss.item()
 
-                        avg_val_loss = total_val_loss / len(self.val_dl)
-                        print(f"Validation Loss at step {self.step}: {avg_val_loss:.4f}")
+                    avg_val_loss = total_val_loss / len(self.val_dl)
+                    print(f"Validation Loss at step {self.step}: {avg_val_loss:.4f}")
 
-                        if self.writer:
-                            self.writer.add_scalar('loss/val', avg_val_loss, self.step)
+                    if self.writer:
+                        self.writer.add_scalar('loss/val', avg_val_loss, self.step)
 
                     milestone = self.step // self.save_and_sample_every
                     print(f"Sampling for milestone {milestone}...")
@@ -1419,8 +1422,8 @@ class Trainer(object):
                 steps=20
             )
 
-            input1 = (gen_test + 1) / 2.0
-            input2 = (test_img + 1) / 2.0
+            input1 = normalize_for_metrics(gen_test)
+            input2 = normalize_for_metrics(test_img)
 
             psnr_val = self.metrics.psnr_3d(input1, input2)
             ssim_val, _ = self.metrics.ssim_3d(input1, input2)

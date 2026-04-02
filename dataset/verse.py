@@ -76,8 +76,10 @@ class VerseDataset(Dataset):
         if ct_tensor.ndim == 3:
             ct_tensor = ct_tensor.unsqueeze(0)
             
-        # [0, 1] to [-1, 1]
-        ct_tensor = (ct_tensor * 2.0) - 1.0
+        HU_MIN, HU_MAX = -300.0, 1000.0
+        ct_tensor = (ct_tensor - HU_MIN) / (HU_MAX - HU_MIN)
+        ct_tensor = ct_tensor.clamp(0, 1)
+        ct_tensor = ct_tensor * 2.0 - 1.0
 
 
         # (N_angles, H, W)
@@ -87,6 +89,9 @@ class VerseDataset(Dataset):
         proj_tensor = torch.from_numpy(projections).float()
         angles_tensor = torch.from_numpy(angles).float()
         
+        proj_tensor = (proj_tensor - proj_tensor.min()) / (proj_tensor.max() - proj_tensor.min() + 1e-8)
+        proj_tensor = proj_tensor.clamp(0, 1)
+
         # (N, H, W) -> (N, 1, H, W)
         if proj_tensor.ndim == 3:
             proj_tensor = proj_tensor.unsqueeze(1)

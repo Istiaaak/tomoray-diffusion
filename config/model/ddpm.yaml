@@ -1,4 +1,4 @@
-name: diffusion_all_ctspine_3e-4
+name: diffusion_all_ctspine_2e-4
 diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
